@@ -29,6 +29,7 @@ motyga-api = { workspace = true }
 motyga-app-server-protocol = { workspace = true }
 motyga-apply-patch = { workspace = true }
 motyga-async-utils = { workspace = true }
+motyga-client = { workspace = true }
 motyga-code-mode = { workspace = true }
 motyga-connectors = { workspace = true }
 motyga-context-fragments = { workspace = true }
@@ -80,6 +81,7 @@ motyga-windows-sandbox = { package = "motyga-windows-sandbox", path = "../window
 csv = { workspace = true }
 dirs = { workspace = true }
 dunce = { workspace = true }
+encoding_rs = { workspace = true }
 eventsource-stream = { workspace = true }
 futures = { workspace = true }
 http = { workspace = true }
@@ -107,6 +109,7 @@ thiserror = { workspace = true }
 tokio = { workspace = true, features = [
     "io-std",
     "macros",
+    "net",
     "process",
     "rt-multi-thread",
     "signal",

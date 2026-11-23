@@ -542,6 +542,26 @@ fn loaded_instructions_with_only_empty_or_whitespace_entries_are_empty() {
     assert!(whitespace.is_empty());
 }
 
+#[tokio::test]
+async fn untrusted_project_keeps_only_user_instructions() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    fs::write(tmp.path().join("AGENTS.md"), "project doc").unwrap();
+    let mut config = make_config(&tmp, /*limit*/ 4096, Some("user doc")).await;
+
+    config.active_project.trust_level = Some(motyga_protocol::config_types::TrustLevel::Untrusted);
+    let untrusted = get_user_instructions(&config).await;
+    config.active_project.trust_level = Some(motyga_protocol::config_types::TrustLevel::Trusted);
+    let trusted = get_user_instructions(&config).await;
+
+    assert_eq!(
+        (untrusted, trusted),
+        (
+            Some("user doc".to_string()),
+            Some("user doc\n\n--- project-doc ---\n\nproject doc".to_string())
+        )
+    );
+}
+
 /// Small file within the byte-limit is returned unmodified.
 #[tokio::test]
 async fn doc_smaller_than_limit_is_returned() {

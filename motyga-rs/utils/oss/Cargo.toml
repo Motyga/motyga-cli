@@ -8,10 +8,20 @@ license.workspace = true
 workspace = true
 
 [dependencies]
+futures = { workspace = true, features = ["alloc"] }
+motyga-config = { workspace = true }
 motyga-core = { workspace = true }
 motyga-lmstudio = { workspace = true }
 motyga-model-provider-info = { workspace = true }
 motyga-ollama = { workspace = true }
+reqwest = { workspace = true, features = ["json"] }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+pretty_assertions = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+toml = { workspace = true }
+wiremock = { workspace = true }
 
 [lib]
 doctest = false

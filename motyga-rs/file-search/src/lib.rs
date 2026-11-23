@@ -14,6 +14,7 @@ use nucleo::Utf32String;
 use nucleo::pattern::CaseMatching;
 use nucleo::pattern::Normalization;
 use serde::Serialize;
+use std::collections::HashSet;
 use std::num::NonZero;
 use std::path::Path;
 use std::path::PathBuf;
@@ -413,15 +414,30 @@ fn walker_worker(
     override_matcher: Option<ignore::overrides::Override>,
     injector: Injector<Arc<str>>,
 ) {
-    let Some(first_root) = inner.search_directories.first() else {
+    let roots = &inner.search_directories;
+    let Some((first_root, other_roots)) = roots.split_first() else {
         let _ = inner.work_tx.send(WorkSignal::WalkComplete);
         return;
     };
 
     let mut walk_builder = WalkBuilder::new(first_root);
-    for root in inner.search_directories.iter().skip(1) {
-        walk_builder.add(root);
+    let mut walk_roots = HashSet::from([first_root.as_path()]);
+    for root in other_roots {
+        if walk_roots.insert(root.as_path()) {
+            walk_builder.add(root);
+        }
     }
+    // Keep both walks for nested roots: ignore rules can expose different entries.
+    // Only those subtrees need to remember paths already sent to the matcher.
+    let seen_paths: Vec<_> = roots
+        .iter()
+        .map(|root| {
+            root.ancestors()
+                .skip(1)
+                .any(|parent| walk_roots.contains(parent))
+                .then(|| Mutex::new(HashSet::new()))
+        })
+        .collect();
     walk_builder
         .threads(inner.threads)
         // Allow hidden entries.
@@ -448,7 +464,7 @@ fn walker_worker(
     walker.run(|| {
         const CHECK_INTERVAL: usize = 1024;
         let mut n = 0;
-        let search_directories = inner.search_directories.clone();
+        let seen_paths = &seen_paths;
         let injector = injector.clone();
         let cancelled = inner.cancelled.clone();
         let shutdown = inner.shutdown.clone();
@@ -462,7 +478,13 @@ fn walker_worker(
             let Some(full_path) = path.to_str() else {
                 return ignore::WalkState::Continue;
             };
-            if let Some((_, relative_path)) = get_file_path(path, &search_directories) {
+            if let Some((root_idx, relative_path)) = get_file_path(path, roots)
+                && seen_paths[root_idx].as_ref().is_none_or(|seen| {
+                    seen.lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .insert(PathBuf::from(relative_path))
+                })
+            {
                 injector.push(Arc::from(full_path), |_, cols| {
                     cols[0] = Utf32String::from(relative_path);
                 });
@@ -656,6 +678,43 @@ mod tests {
     use std::time::Duration;
     use std::time::Instant;
     use tempfile::TempDir;
+
+    #[test]
+    fn overlapping_roots_share_result_slots_by_path() {
+        let dir = TempDir::new().unwrap();
+        let parent = dir.path().to_path_buf();
+        let child = parent.join("sub");
+        fs::create_dir(&child).unwrap();
+        let expected =
+            [parent.clone(), child.clone()].map(|root| (root, PathBuf::from("target.txt")));
+        for (root, path) in &expected {
+            fs::write(root.join(path), "").unwrap();
+        }
+
+        for roots in [
+            vec![parent.clone(), child.clone(), parent.clone()],
+            vec![child.clone(), parent.clone(), child.clone()],
+        ] {
+            let result = run(
+                "target",
+                roots,
+                FileSearchOptions {
+                    limit: NonZero::new(2).unwrap(),
+                    ..Default::default()
+                },
+                /*cancel_flag*/ None,
+            )
+            .unwrap();
+            let mut paths: Vec<_> = result
+                .matches
+                .into_iter()
+                .map(|m| (m.root, m.path))
+                .collect();
+            paths.sort();
+            assert_eq!(result.total_match_count, expected.len());
+            assert_eq!(paths, expected.to_vec());
+        }
+    }
 
     #[test]
     fn verify_score_is_none_for_non_match() {

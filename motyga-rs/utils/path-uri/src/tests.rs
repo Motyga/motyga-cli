@@ -67,6 +67,35 @@ fn file_uri_parses_a_windows_path_on_any_host() {
 }
 
 #[test]
+fn path_uri_equality_and_hashing_follow_path_convention() {
+    for (left, right, expected) in [
+        ("file:///C:/Users/Alice", "file:///c:/users/ALICE", true),
+        (
+            "file://SERVER/SHARE/Project",
+            "file://server/share/project",
+            true,
+        ),
+        ("file:///home/Alice", "file:///home/alice", false),
+        ("file:///C:/plugins/ǈ", "file:///C:/plugins/Ǉ", false),
+        ("file:///C:/plugins/%41", "file:///C:/plugins/a", true),
+        ("file:///C:/plugins/a%2Fb", "file:///C:/plugins/a/b", false),
+        ("file:///%00/bad/path/YQ", "file:///%00/bad/path/yQ", false),
+    ] {
+        let left = PathUri::parse(left).expect("valid left URI");
+        let right = PathUri::parse(right).expect("valid right URI");
+
+        assert_eq!(
+            (
+                left == right,
+                std::collections::HashSet::from([left]).contains(&right),
+            ),
+            (expected, expected),
+            "comparing {right}"
+        );
+    }
+}
+
+#[test]
 fn infers_path_conventions_from_uri_shape() {
     for (uri, expected) in [
         ("file:///", Some(PathConvention::Posix)),
@@ -655,6 +684,26 @@ fn join_normalizes_absolute_parent_segments() {
             r"\\server\share\a\..\b",
             "file://server/share/b",
         ),
+        (
+            "file:///C:/workspace",
+            r"\\?\D:\reports\report.pdf",
+            "file:///D:/reports/report.pdf",
+        ),
+        (
+            "file:///C:/workspace",
+            r"\\.\D:\reports\report.pdf",
+            "file:///D:/reports/report.pdf",
+        ),
+        (
+            "file:///C:/workspace",
+            r"\\?\UNC\server\share\reports\report.pdf",
+            "file://server/share/reports/report.pdf",
+        ),
+        (
+            "file:///C:/workspace",
+            r"\\.\UNC\server\share\reports\report.pdf",
+            "file://server/share/reports/report.pdf",
+        ),
         ("file:///workspace", "/tmp//a/../b", "file:///tmp/b"),
         ("file:///workspace", "/tmp/a/..//b", "file:///tmp/b"),
         ("file:///workspace", "/tmp/a///../b", "file:///tmp/b"),
@@ -682,6 +731,49 @@ fn join_normalizes_absolute_parent_segments() {
     ] {
         let base = PathUri::parse(base).expect("valid base URI");
         let expected = PathUri::parse(expected).expect("valid expected URI");
+        if normalize_windows_device_path(path).is_some() {
+            assert_eq!(
+                LegacyAppPathString::from_path(std::path::Path::new(path))
+                    .to_path_uri(PathConvention::Windows),
+                Ok(expected.clone()),
+                "converting {path}"
+            );
+        }
+        assert_eq!(base.join(path), Ok(expected), "joining {path}");
+    }
+}
+
+#[test]
+fn windows_namespace_normalization_preserves_opaque_paths() {
+    let base = PathUri::parse("file:///C:/workspace").expect("valid Windows base URI");
+
+    for path in [
+        r"\\?\UNC\server",
+        r"\\.\UNC\server",
+        r"\\?\UNC\localhost\share\report.pdf",
+        r"\\.\UNC\LOCALHOST\share\report.pdf",
+        r"\\?\UNC\.\share\report.pdf",
+        r"\\.\UNC\..\share\report.pdf",
+        r"\\?\UNC\server\.\report.pdf",
+        r"\\.\UNC\server\..\report.pdf",
+        r"\\?\UNC\?\UNC\?\C:\report.pdf",
+        r"\\.\UNC\?\UNC\?\C:\report.pdf",
+        r"\\.\COM1",
+        r"\\?\Volume{00000000-0000-0000-0000-000000000000}\report.pdf",
+    ] {
+        let expected = windows_opaque_path_uri(path);
+
+        assert_eq!(
+            PathUri::from_absolute_native_path(path, PathConvention::Windows),
+            Some(expected.clone()),
+            "parsing {path}"
+        );
+        assert_eq!(
+            LegacyAppPathString::from_path(std::path::Path::new(path))
+                .to_path_uri(PathConvention::Windows),
+            Ok(expected.clone()),
+            "converting {path}"
+        );
         assert_eq!(base.join(path), Ok(expected), "joining {path}");
     }
 }
@@ -849,6 +941,22 @@ fn starts_with_uses_uri_segment_boundaries() {
             "file:///C:/plugins/foo",
             true,
         ),
+        ("file:///C:/project/secret", "file:///%63%3A/project", false),
+        (
+            "file:///C:/Work/Repo/src/main.rs",
+            "file:///c:/work/repo",
+            true,
+        ),
+        (
+            "file:///C:/PLUGINS/%C3%84/assets/icon.svg",
+            "file:///c:/plugins/%C3%A4",
+            false,
+        ),
+        (
+            "file:///C:/plugins/ǈ/assets/icon.svg",
+            "file:///C:/plugins/Ǉ",
+            false,
+        ),
         (
             "file:///C:/plugins/foo2/assets/icon.svg",
             "file:///C:/plugins/foo",
@@ -859,6 +967,12 @@ fn starts_with_uses_uri_segment_boundaries() {
             "file://server/share/plugins/foo",
             true,
         ),
+        (
+            "file://SERVER/SHARE/PLUGINS/FOO/icon.svg",
+            "file://server/share/plugins/foo",
+            true,
+        ),
+        ("file:///WORKSPACE/plugin", "file:///workspace", false),
         (
             "file://other/share/plugins/foo/icon.svg",
             "file://server/share/plugins/foo",

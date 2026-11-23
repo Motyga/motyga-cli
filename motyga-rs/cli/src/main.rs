@@ -45,6 +45,7 @@ use supports_color::Stream;
 
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 mod app_cmd;
+mod config_override_args;
 // Kept for the future Motyga Desktop app; intentionally not invoked yet (see app_cmd::run_app),
 // so `motyga app` can never download a third-party desktop build.
 #[cfg(any(target_os = "macos", target_os = "windows"))]
@@ -52,6 +53,7 @@ mod app_cmd;
 mod desktop_app;
 mod doctor;
 mod exec_server_telemetry;
+mod local_cmd;
 mod mcp_cmd;
 mod remote_control_cmd;
 #[cfg(target_os = "windows")]
@@ -60,6 +62,7 @@ mod state_db_recovery;
 #[cfg(not(windows))]
 mod wsl_paths;
 
+use crate::local_cmd::LocalCli;
 use crate::mcp_cmd::McpCli;
 use crate::remote_control_cmd::RemoteControlCommand;
 use doctor::DoctorCommand;
@@ -136,6 +139,9 @@ enum Subcommand {
 
     /// Manage external MCP servers for Motyga.
     Mcp(McpCli),
+
+    /// Use local models: find running Ollama / LM Studio / llama.cpp / vLLM servers and register them.
+    Local(LocalCli),
 
     /// Start Motyga as an MCP server (stdio).
     McpServer(McpServerCommand),
@@ -868,8 +874,13 @@ async fn run_debug_app_server_command(cmd: DebugAppServerCommand) -> anyhow::Res
     match cmd.subcommand {
         DebugAppServerSubcommand::SendMessageV2(cmd) => {
             let motyga_bin = std::env::current_exe()?;
-            motyga_app_server_test_client::send_message_v2(&motyga_bin, &[], cmd.user_message, &None)
-                .await
+            motyga_app_server_test_client::send_message_v2(
+                &motyga_bin,
+                &[],
+                cmd.user_message,
+                &None,
+            )
+            .await
         }
     }
 }
@@ -972,7 +983,8 @@ async fn cli_main(
         remote,
         mut interactive,
         subcommand,
-    } = MultitoolCli::parse();
+    } = config_override_args::try_parse_from(std::env::args_os())
+        .unwrap_or_else(|error| error.exit());
 
     // Fold --enable/--disable into config overrides so they flow to all subcommands.
     let toggle_overrides = feature_toggles.to_overrides()?;
@@ -1054,6 +1066,18 @@ async fn cli_main(
                 strict_config || root_strict_config,
             )
             .await?;
+        }
+        Some(Subcommand::Local(mut local_cli)) => {
+            reject_remote_mode_for_subcommand(
+                root_remote.as_deref(),
+                root_remote_auth_token_env.as_deref(),
+                "local",
+            )?;
+            prepend_config_flags(
+                &mut local_cli.config_overrides,
+                root_config_overrides.clone(),
+            );
+            local_cmd::run(local_cli).await?;
         }
         Some(Subcommand::Mcp(mut mcp_cli)) => {
             reject_remote_mode_for_subcommand(
@@ -2090,6 +2114,7 @@ fn unsupported_subcommand_name_for_strict_config(
         }
         Some(Subcommand::RemoteControl(remote_control)) => Some(remote_control.subcommand_name()),
         Some(Subcommand::Mcp(_)) => Some("mcp"),
+        Some(Subcommand::Local(_)) => Some("local"),
         #[cfg(any(target_os = "macos", target_os = "windows"))]
         Some(Subcommand::App(_)) => Some("app"),
         Some(Subcommand::Login(_)) => Some("login"),
@@ -3275,8 +3300,9 @@ mod tests {
 
     #[test]
     fn fork_last_accepts_prompt_positional() {
-        let interactive =
-            finalize_fork_from_args(["motyga", "fork", "--last", "/compact focus on auth"].as_ref());
+        let interactive = finalize_fork_from_args(
+            ["motyga", "fork", "--last", "/compact focus on auth"].as_ref(),
+        );
 
         assert!(!interactive.fork_picker);
         assert!(interactive.fork_last);
@@ -3629,7 +3655,13 @@ mod tests {
     #[test]
     fn app_server_listen_unix_socket_path_parses() {
         let app_server = app_server_from_args(
-            ["motyga", "app-server", "--listen", "unix:///tmp/motyga.sock"].as_ref(),
+            [
+                "motyga",
+                "app-server",
+                "--listen",
+                "unix:///tmp/motyga.sock",
+            ]
+            .as_ref(),
         );
         assert_eq!(
             app_server.listen,
@@ -3730,8 +3762,9 @@ mod tests {
 
     #[test]
     fn app_server_proxy_sock_path_parses() {
-        let app_server =
-            app_server_from_args(["motyga", "app-server", "proxy", "--sock", "motyga.sock"].as_ref());
+        let app_server = app_server_from_args(
+            ["motyga", "app-server", "proxy", "--sock", "motyga.sock"].as_ref(),
+        );
         let Some(AppServerSubcommand::Proxy(proxy)) = app_server.subcommand else {
             panic!("expected proxy subcommand");
         };

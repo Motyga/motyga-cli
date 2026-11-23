@@ -321,11 +321,32 @@ impl CoreToolRuntime for ExposureOverride {
 
 pub struct ToolRegistry {
     tools: HashMap<ToolName, Arc<dyn CoreToolRuntime>>,
+    /// Model-visible names that stand for a registered tool, e.g. the plain
+    /// `mcp__server__tool` function a provider without namespace support calls
+    /// in place of the namespaced MCP tool.
+    aliases: HashMap<ToolName, ToolName>,
 }
 
 impl ToolRegistry {
     fn new(tools: HashMap<ToolName, Arc<dyn CoreToolRuntime>>) -> Self {
-        Self { tools }
+        Self {
+            tools,
+            aliases: HashMap::new(),
+        }
+    }
+
+    /// Routes calls made under each alias to its target tool. An alias that
+    /// shadows a registered tool, or points at an unknown one, is ignored.
+    pub(crate) fn with_aliases(mut self, mut aliases: HashMap<ToolName, ToolName>) -> Self {
+        aliases.retain(|alias, target| {
+            !self.tools.contains_key(alias) && self.tools.contains_key(target)
+        });
+        self.aliases = aliases;
+        self
+    }
+
+    fn canonical_name<'a>(&'a self, name: &'a ToolName) -> &'a ToolName {
+        self.aliases.get(name).unwrap_or(name)
     }
 
     #[instrument(level = "trace", skip_all)]
@@ -357,7 +378,7 @@ impl ToolRegistry {
     }
 
     fn tool(&self, name: &ToolName) -> Option<Arc<dyn CoreToolRuntime>> {
-        self.tools.get(name).map(Arc::clone)
+        self.tools.get(self.canonical_name(name)).map(Arc::clone)
     }
 
     #[cfg(test)]
@@ -407,6 +428,9 @@ impl ToolRegistry {
         mut invocation: ToolInvocation,
         terminal_outcome_reached: Option<Arc<AtomicBool>>,
     ) -> Result<AnyToolResult, FunctionCallError> {
+        if let Some(canonical) = self.aliases.get(&invocation.tool_name) {
+            invocation.tool_name = canonical.clone();
+        }
         let tool_name = invocation.tool_name.clone();
         let tool_name_flat = flat_tool_name(&tool_name);
         let call_id_owned = invocation.call_id.clone();

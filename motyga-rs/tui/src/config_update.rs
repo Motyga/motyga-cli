@@ -77,6 +77,15 @@ pub(crate) fn build_model_selection_edits(
     ]
 }
 
+/// A model picked while on a local provider is saved for `--oss` only, so the
+/// cloud provider's `model` (and its reasoning effort) stay untouched.
+pub(crate) fn build_local_model_selection_edits(provider_id: &str, model: &str) -> Vec<ConfigEdit> {
+    vec![
+        replace_config_value("oss_provider", serde_json::json!(provider_id)),
+        replace_config_value("oss_model", serde_json::json!(model)),
+    ]
+}
+
 pub(crate) fn build_service_tier_selection_edits(service_tier: Option<&str>) -> Vec<ConfigEdit> {
     let service_tier_edit = service_tier.map_or_else(
         || clear_config_value("service_tier"),

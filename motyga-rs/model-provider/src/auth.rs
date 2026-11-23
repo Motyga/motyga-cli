@@ -156,16 +156,30 @@ pub(crate) fn resolve_provider_auth(
             // the fresh login. Kept deliberately narrow — first-party provider and an API-key login
             // only, so a third-party provider can never be handed a credential minted for us.
             let stored_login_usable =
-                provider.is_motyga() && matches!(auth, Some(MotygaAuth::ApiKey(_)));
+                provider.accepts_motyga_login() && matches!(auth, Some(MotygaAuth::ApiKey(_)));
             if !(stored_login_usable && matches!(err, MotygaErr::EnvVar(_))) {
                 return Err(err);
             }
         }
     }
 
+    // A stored login was minted for Motyga (or OpenAI). A local server or any other
+    // third-party endpoint without its own credentials must not receive it, and a Motyga
+    // key only goes to Motyga hosts, whatever the provider is called. A provider with
+    // `auth.command` gets an auth manager scoped to that command, so `auth` is then the
+    // provider's own token.
+    let holds_motyga_key = auth
+        .and_then(MotygaAuth::api_key)
+        .is_some_and(|key| key.starts_with("nb-"));
+    let accepts_auth = provider.has_command_auth()
+        || if holds_motyga_key {
+            provider.accepts_motyga_login()
+        } else {
+            provider.is_motyga() || provider.is_openai() || provider.requires_openai_auth
+        };
     Ok(match auth {
-        Some(auth) => auth_provider_from_auth(auth),
-        None => unauthenticated_auth_provider(),
+        Some(auth) if accepts_auth => auth_provider_from_auth(auth),
+        Some(_) | None => unauthenticated_auth_provider(),
     })
 }
 
@@ -662,6 +676,7 @@ mod tests {
         // never be handed it just because the env var happens to be missing.
         let provider = ModelProviderInfo {
             name: "Some Other Provider".to_string(),
+            base_url: Some("https://llm.example.com/v1".to_string()),
             ..motyga_provider_without_env_key()
         };
         let auth = MotygaAuth::from_api_key("nb-stored-login-secret");
@@ -671,5 +686,104 @@ mod tests {
         };
 
         assert!(matches!(err, MotygaErr::EnvVar(_)), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn keyless_third_party_providers_get_no_stored_login() {
+        let auth = MotygaAuth::from_api_key("nb-stored-login-secret");
+        let local = motyga_model_provider_info::create_oss_provider_with_base_url(
+            "http://localhost:11434/v1",
+            motyga_model_provider_info::WireApi::Responses,
+        );
+        let remote = ModelProviderInfo {
+            name: "Some Gateway".to_string(),
+            base_url: Some("https://llm.example.com/v1".to_string()),
+            ..ModelProviderInfo::default()
+        };
+
+        let headers: Vec<Option<String>> = [local, remote]
+            .iter()
+            .map(|provider| {
+                resolve_provider_auth(Some(&auth), provider)
+                    .expect("keyless provider should resolve")
+                    .to_auth_headers()
+                    .get(http::header::AUTHORIZATION)
+                    .and_then(|value| value.to_str().ok().map(str::to_string))
+            })
+            .collect();
+
+        assert_eq!(headers, vec![None, None]);
+    }
+
+    #[test]
+    fn motyga_key_follows_the_endpoint_not_the_provider_name() {
+        let auth = MotygaAuth::from_api_key("nb-stored-login-secret");
+        let spoofed = ModelProviderInfo {
+            base_url: Some("https://collector.example/v1".to_string()),
+            env_key: None,
+            ..ModelProviderInfo::create_motyga_provider()
+        };
+        let openai_proxy = ModelProviderInfo {
+            env_key: None,
+            ..ModelProviderInfo::create_openai_provider(Some(
+                "https://collector.example/v1".to_string(),
+            ))
+        };
+        let mirror = ModelProviderInfo {
+            name: "Motyga RU".to_string(),
+            base_url: Some("https://ru.motyga.com/v1".to_string()),
+            env_key: None,
+            ..ModelProviderInfo::create_motyga_provider()
+        };
+
+        let headers: Vec<Option<String>> = [spoofed, openai_proxy, mirror]
+            .iter()
+            .map(|provider| {
+                resolve_provider_auth(Some(&auth), provider)
+                    .expect("provider should resolve")
+                    .to_auth_headers()
+                    .get(http::header::AUTHORIZATION)
+                    .and_then(|value| value.to_str().ok().map(str::to_string))
+            })
+            .collect();
+
+        assert_eq!(
+            headers,
+            vec![
+                None,
+                None,
+                Some("Bearer nb-stored-login-secret".to_string())
+            ]
+        );
+    }
+
+    #[test]
+    fn command_auth_provider_keeps_its_own_token() {
+        // `auth.command` gets a provider-scoped auth manager, so `auth` is the command's
+        // token rather than the stored Motyga login.
+        let provider = ModelProviderInfo {
+            name: "Gateway With Command Auth".to_string(),
+            base_url: Some("https://llm.example.com/v1".to_string()),
+            auth: Some(motyga_protocol::config_types::ModelProviderAuthInfo {
+                command: "print-token".to_string(),
+                args: Vec::new(),
+                timeout_ms: std::num::NonZeroU64::new(5_000).expect("non-zero timeout"),
+                refresh_interval_ms: 300_000,
+                cwd: std::env::current_dir()
+                    .expect("current dir should be available")
+                    .try_into()
+                    .expect("current dir should be absolute"),
+            }),
+            ..ModelProviderInfo::default()
+        };
+        let auth = MotygaAuth::from_api_key("command-token");
+
+        let header = resolve_provider_auth(Some(&auth), &provider)
+            .expect("command auth provider should resolve")
+            .to_auth_headers()
+            .get(http::header::AUTHORIZATION)
+            .and_then(|value| value.to_str().ok().map(str::to_string));
+
+        assert_eq!(header, Some("Bearer command-token".to_string()));
     }
 }

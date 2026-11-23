@@ -145,6 +145,29 @@ async fn next_thread_settings_updated(
 }
 
 #[tokio::test]
+async fn pasted_text_normalizes_mixed_line_endings_at_app_boundary() -> Result<()> {
+    let mut app = make_test_app().await;
+    let mut app_server = start_config_write_test_app_server(&app).await?;
+    let mut tui = crate::tui::test_support::make_test_tui()?;
+
+    app.handle_tui_event(
+        &mut tui,
+        &mut app_server,
+        TuiEvent::Paste("line1\r\nline2\rline3\nline4".to_string()),
+    )
+    .await?;
+
+    assert_snapshot!(app.chat_widget.composer_text_with_pending(), @r"
+    line1
+    line2
+    line3
+    line4
+    ");
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn handle_mcp_inventory_result_respects_origin_thread() {
     let mut app = make_test_app().await;
     app.transcript_cells

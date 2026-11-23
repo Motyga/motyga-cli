@@ -355,6 +355,156 @@ fn test_merge_configured_model_providers_adds_custom_provider() {
 }
 
 #[test]
+fn test_merge_configured_model_providers_lets_local_servers_replace_oss_builtins() {
+    let remote_ollama = ModelProviderInfo {
+        name: "Ollama".to_string(),
+        base_url: Some("http://192.168.1.20:11434/v1".to_string()),
+        ..ModelProviderInfo::default()
+    };
+    let configured_model_providers = std::collections::HashMap::from([(
+        OLLAMA_OSS_PROVIDER_ID.to_string(),
+        remote_ollama.clone(),
+    )]);
+
+    let mut expected = built_in_model_providers(/*openai_base_url*/ None);
+    expected.insert(OLLAMA_OSS_PROVIDER_ID.to_string(), remote_ollama);
+
+    assert_eq!(
+        merge_configured_model_providers(
+            built_in_model_providers(/*openai_base_url*/ None),
+            configured_model_providers,
+        ),
+        Ok(expected)
+    );
+}
+
+#[test]
+fn test_merge_configured_model_providers_moves_motyga_to_a_mirror_only() {
+    let mirror = ModelProviderInfo {
+        name: "Motyga".to_string(),
+        base_url: Some("https://ru.motyga.com/v1".to_string()),
+        ..ModelProviderInfo::default()
+    };
+    let mut expected = built_in_model_providers(/*openai_base_url*/ None);
+    expected
+        .get_mut(MOTYGA_PROVIDER_ID)
+        .expect("built-in motyga provider")
+        .base_url = Some("https://ru.motyga.com/v1".to_string());
+
+    assert_eq!(
+        merge_configured_model_providers(
+            built_in_model_providers(/*openai_base_url*/ None),
+            std::collections::HashMap::from([(MOTYGA_PROVIDER_ID.to_string(), mirror)]),
+        ),
+        Ok(expected)
+    );
+
+    let elsewhere = ModelProviderInfo {
+        name: "Motyga".to_string(),
+        base_url: Some("https://evil.example/v1".to_string()),
+        ..ModelProviderInfo::default()
+    };
+    assert!(
+        merge_configured_model_providers(
+            built_in_model_providers(/*openai_base_url*/ None),
+            std::collections::HashMap::from([(MOTYGA_PROVIDER_ID.to_string(), elsewhere)]),
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn test_is_motyga_base_url_requires_https_on_motyga_hosts() {
+    let cases = [
+        ("https://api.motyga.com/v1", true),
+        ("https://ru.motyga.com/v1", true),
+        ("https://MOTYGA.COM./v1", true),
+        ("http://api.motyga.com/v1", false),
+        ("https://evilmotyga.com/v1", false),
+        ("https://motyga.com.evil.io/v1", false),
+        ("https://evil.example\\@api.motyga.com/v1", false),
+        ("https://api.motyga.com@evil.example/v1", false),
+    ];
+
+    let results: Vec<(&str, bool)> = cases
+        .iter()
+        .map(|(url, _)| (*url, is_motyga_base_url(url)))
+        .collect();
+    assert_eq!(results, cases.to_vec());
+}
+
+#[test]
+fn test_is_local_base_url_covers_loopback_and_private_networks() {
+    let local = [
+        "http://localhost:11434/v1",
+        "http://LOCALHOST:1234/v1",
+        "http://127.0.0.1:8080/v1",
+        "http://0.0.0.0:8000/v1",
+        "http://[::1]:8080/v1",
+        "http://10.0.0.5:8000/v1",
+        "http://172.20.1.2/v1",
+        "http://192.168.1.20:11434/v1",
+        "http://169.254.10.1/v1",
+        "http://[fd00::12]:8000/v1",
+        "http://gpu-box.local:8080/v1",
+        "http://gpu-box.lan/v1",
+        "http://host.docker.internal:11434/v1",
+        "http://user:pass@192.168.0.2:8000/v1",
+        "http://[::ffff:127.0.0.1]:8080/v1",
+    ];
+    let remote = [
+        "https://api.motyga.com/v1",
+        "https://api.openai.com/v1",
+        "http://8.8.8.8/v1",
+        "http://172.32.0.1/v1",
+        "https://localhost.example.com/v1",
+        "http://192.168.1.20.nip.io/v1",
+        "http://evil.example\\@192.168.0.1/v1",
+        "http://[::ffff:8.8.8.8]/v1",
+        "not a url",
+        "http:///v1",
+    ];
+
+    let local_results: Vec<(&str, bool)> = local
+        .iter()
+        .map(|url| (*url, is_local_base_url(url)))
+        .collect();
+    let remote_results: Vec<(&str, bool)> = remote
+        .iter()
+        .map(|url| (*url, is_local_base_url(url)))
+        .collect();
+    assert_eq!(
+        local_results,
+        local.iter().map(|url| (*url, true)).collect::<Vec<_>>()
+    );
+    assert_eq!(
+        remote_results,
+        remote.iter().map(|url| (*url, false)).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn test_is_local_server_excludes_first_party_providers() {
+    let local_motyga = ModelProviderInfo {
+        base_url: Some("http://localhost:8000/v1".to_string()),
+        ..ModelProviderInfo::create_motyga_provider()
+    };
+    let local_openai =
+        ModelProviderInfo::create_openai_provider(Some("http://localhost:8000/v1".to_string()));
+
+    assert_eq!(
+        [
+            create_oss_provider_with_base_url("http://localhost:11434/v1", WireApi::Responses)
+                .is_local_server(),
+            local_motyga.is_local_server(),
+            local_openai.is_local_server(),
+            ModelProviderInfo::create_motyga_provider().is_local_server(),
+        ],
+        [true, false, false, false]
+    );
+}
+
+#[test]
 fn test_merge_configured_model_providers_applies_amazon_bedrock_profile_override() {
     let configured_model_providers = std::collections::HashMap::from([(
         AMAZON_BEDROCK_PROVIDER_ID.to_string(),

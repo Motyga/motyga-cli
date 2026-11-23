@@ -62,7 +62,7 @@ use motyga_utils_absolute_path::AbsolutePathBuf;
 use motyga_utils_absolute_path::canonicalize_existing_preserving_symlinks;
 use motyga_utils_home_dir::find_motyga_home;
 use motyga_utils_oss::ensure_oss_provider_ready;
-use motyga_utils_oss::get_default_model_for_oss_provider;
+use motyga_utils_oss::pick_oss_session_model;
 use color_eyre::eyre::WrapErr;
 use cwd_prompt::CwdPromptAction;
 pub use session_archive_commands::DeleteConfirmation;
@@ -867,6 +867,11 @@ pub async fn run_main(
     };
 
     // Map the legacy --search flag to the canonical web_search mode.
+    // Naming a local provider is a request to use it.
+    if cli.oss_provider.is_some() {
+        cli.oss = true;
+    }
+
     if cli.web_search {
         cli.config_overrides
             .raw_overrides
@@ -878,7 +883,7 @@ pub async fn run_main(
     let raw_overrides = cli.config_overrides.raw_overrides.clone();
     // `oss` model provider.
     let overrides_cli = motyga_utils_cli::CliConfigOverrides { raw_overrides };
-    let cli_kv_overrides = match overrides_cli.parse_overrides() {
+    let mut cli_kv_overrides = match overrides_cli.parse_overrides() {
         // Parse `-c` overrides from the CLI.
         Ok(v) => v,
         #[allow(clippy::print_stderr)]
@@ -1031,15 +1036,24 @@ pub async fn run_main(
         None
     };
 
-    // When using `--oss`, let the bootstrapper pick the model based on selected provider
-    let model = if let Some(model) = &cli.model {
+    // With `--oss`, never inherit `model` (it names a cloud model): use `-m`, the saved
+    // `oss_model`, or a model the local server already has, with the server's context window.
+    let model = if let Some(provider_id) = model_provider_override.as_deref()
+        && cli.oss
+    {
+        let picked = pick_oss_session_model(provider_id, cli.model.as_deref(), bootstrap_config_toml)
+            .await
+            .ok_or_else(|| {
+                std::io::Error::other(format!(
+                    "No model to run on local provider `{provider_id}`: load a model on the server or pass -m <model> (see `motyga local`)."
+                ))
+            })?;
+        if let Some(window) = picked.context_window {
+            cli_kv_overrides.push(("model_context_window".to_string(), toml::Value::Integer(window)));
+        }
+        Some(picked.model)
+    } else if let Some(model) = &cli.model {
         Some(model.clone())
-    } else if cli.oss {
-        // Use the provider from model_provider_override
-        model_provider_override
-            .as_ref()
-            .and_then(|provider_id| get_default_model_for_oss_provider(provider_id))
-            .map(std::borrow::ToOwned::to_owned)
     } else {
         None // No model specified, will use the default.
     };
@@ -1236,7 +1250,8 @@ pub async fn run_main(
                 ));
             }
         };
-        ensure_oss_provider_ready(provider_id, &config).await?;
+        let warnings = ensure_oss_provider_ready(provider_id, &config).await?;
+        config.startup_warnings.extend(warnings);
     }
 
     let otel_logger_layer = otel.as_ref().and_then(|o| o.logger_layer());

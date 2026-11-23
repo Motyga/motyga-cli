@@ -81,9 +81,8 @@ pub fn arg0_dispatch() -> Option<Arg0PathEntryGuard> {
             Ok(runtime) => runtime,
             Err(_) => std::process::exit(1),
         };
-        let exit_code = runtime.block_on(
-            motyga_shell_escalation::run_shell_escalation_execve_wrapper(file, argv),
-        );
+        let exit_code = runtime
+            .block_on(motyga_shell_escalation::run_shell_escalation_execve_wrapper(file, argv));
         match exit_code {
             Ok(exit_code) => std::process::exit(exit_code),
             Err(_) => std::process::exit(1),
@@ -123,8 +122,10 @@ pub fn arg0_dispatch() -> Option<Arg0PathEntryGuard> {
                     Err(_) => std::process::exit(1),
                 };
                 let cwd = cwd.into();
-                match runtime.block_on(motyga_apply_patch::apply_patch(
+                let update_file_mode = motyga_apply_patch::apply_patch_file_update_mode_from_env();
+                match runtime.block_on(motyga_apply_patch::apply_patch_with_mode(
                     &patch_arg,
+                    update_file_mode,
                     &cwd,
                     &mut stdout,
                     &mut stderr,
@@ -522,9 +523,9 @@ mod tests {
     use super::run_main_with_arg0_guard;
     #[cfg(unix)]
     use anyhow::ensure;
-    use motyga_install_context::MotygaPackageLayout;
     use motyga_install_context::InstallContext;
     use motyga_install_context::InstallMethod;
+    use motyga_install_context::MotygaPackageLayout;
     use motyga_utils_absolute_path::AbsolutePathBuf;
     use pretty_assertions::assert_eq;
     use std::fs;

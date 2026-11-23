@@ -46,6 +46,7 @@ motyga-mcp = { workspace = true }
 motyga-supply = { workspace = true }
 motyga-mcp-server = { workspace = true }
 motyga-model-provider = { workspace = true }
+motyga-model-provider-info = { workspace = true }
 motyga-models-manager = { workspace = true }
 motyga-plugin = { workspace = true }
 motyga-protocol = { workspace = true }
@@ -59,8 +60,10 @@ motyga-stdio-to-uds = { workspace = true }
 motyga-terminal-detection = { workspace = true }
 motyga-tui = { workspace = true }
 motyga-utils-absolute-path = { workspace = true }
+motyga-utils-oss = { workspace = true }
 motyga-utils-path = { workspace = true }
 crossterm = { workspace = true }
+futures = { workspace = true, features = ["alloc"] }
 http = { workspace = true }
 libc = { workspace = true }
 os_info = { workspace = true }
@@ -81,6 +84,7 @@ tokio = { workspace = true, features = [
     "time",
 ] }
 toml = { workspace = true }
+toml_edit = { workspace = true }
 tracing = { workspace = true }
 tracing-appender = { workspace = true }
 tracing-subscriber = { workspace = true }

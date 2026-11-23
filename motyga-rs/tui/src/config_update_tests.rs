@@ -24,6 +24,25 @@ fn trusted_project_edit_targets_project_trust_level() {
 }
 
 #[test]
+fn local_model_selection_targets_oss_keys_only() {
+    assert_eq!(
+        build_local_model_selection_edits("ollama", "qwen3:8b"),
+        vec![
+            ConfigEdit {
+                key_path: "oss_provider".to_string(),
+                value: serde_json::json!("ollama"),
+                merge_strategy: MergeStrategy::Replace,
+            },
+            ConfigEdit {
+                key_path: "oss_model".to_string(),
+                value: serde_json::json!("qwen3:8b"),
+                merge_strategy: MergeStrategy::Replace,
+            },
+        ]
+    );
+}
+
+#[test]
 fn format_config_error_preserves_server_validation_message() {
     let err = Err::<(), _>(color_eyre::eyre::eyre!(
         "config/batchWrite failed: Invalid configuration: features.fast_mode=true violates \

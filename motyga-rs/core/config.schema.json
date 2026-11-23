@@ -5328,6 +5328,10 @@
       ],
       "description": "Orchestrator-owned feature settings."
     },
+    "oss_model": {
+      "description": "Model that `--oss` starts with when `oss_provider` is the selected local provider. Kept apart from `model` so a local model name never reaches the cloud provider.",
+      "type": "string"
+    },
     "oss_provider": {
       "description": "Preferred OSS provider for local models, e.g. \"lmstudio\" or \"ollama\".",
       "type": "string"

@@ -16,6 +16,10 @@ use crate::tools::handlers::GetContextRemainingHandler;
 use crate::tools::handlers::ListAvailablePluginsToInstallHandler;
 use crate::tools::handlers::ListMcpResourceTemplatesHandler;
 use crate::tools::handlers::ListMcpResourcesHandler;
+use crate::tools::handlers::LOCAL_WEB_FETCH_TOOL_NAME;
+use crate::tools::handlers::LOCAL_WEB_SEARCH_TOOL_NAME;
+use crate::tools::handlers::LocalWebFetchHandler;
+use crate::tools::handlers::LocalWebSearchHandler;
 use crate::tools::handlers::McpHandler;
 use crate::tools::handlers::NewContextWindowHandler;
 use crate::tools::handlers::PlanHandler;
@@ -90,6 +94,7 @@ use motyga_tools::request_user_input_available_modes;
 use motyga_tools::shell_command_backend_for_features;
 use motyga_tools::shell_type_for_model_and_features;
 use std::collections::BTreeMap;
+use std::collections::HashMap;
 use std::collections::HashSet;
 use std::sync::Arc;
 use tracing::instrument;
@@ -261,15 +266,78 @@ fn build_model_visible_specs_and_registry(
     }
     specs.extend(hosted_specs);
 
-    let registry = ToolRegistry::from_tools(runtimes);
-    let model_visible_specs = merge_into_namespaces(specs)
-        .into_iter()
-        .filter(|spec| {
-            namespace_tools_enabled(turn_context) || !matches!(spec, ToolSpec::Namespace(_))
-        })
-        .collect();
+    let merged_specs = merge_into_namespaces(specs);
+    let (model_visible_specs, aliases) = if namespace_tools_enabled(turn_context) {
+        (merged_specs, HashMap::new())
+    } else {
+        // Every registered plain name is taken, hidden ones included, so a
+        // flattened alias can never land on a different tool.
+        let registered_plain_names = runtimes
+            .iter()
+            .map(|runtime| runtime.tool_name())
+            .filter(|tool_name| tool_name.namespace.is_none())
+            .map(|tool_name| tool_name.name)
+            .collect::<HashSet<_>>();
+        flatten_namespaces(merged_specs, registered_plain_names)
+    };
+    let registry = ToolRegistry::from_tools(runtimes).with_aliases(aliases);
 
     (model_visible_specs, registry)
+}
+
+/// Rewrites namespaced tools as plain functions for providers that do not
+/// understand Responses namespaces (local model servers). Each tool becomes
+/// `<namespace>__<tool>` (the legacy `mcp__server__tool` shape for MCP), with
+/// a numeric suffix if that name is taken, and the returned aliases route
+/// those plain calls back to the namespaced tool.
+fn flatten_namespaces(
+    specs: Vec<ToolSpec>,
+    mut taken_names: HashSet<String>,
+) -> (Vec<ToolSpec>, HashMap<ToolName, ToolName>) {
+    taken_names.extend(
+        specs
+            .iter()
+            .filter(|spec| !matches!(spec, ToolSpec::Namespace(_)))
+            .map(|spec| spec.name().to_string()),
+    );
+    let mut flat_specs = Vec::with_capacity(specs.len());
+    let mut aliases = HashMap::new();
+    for spec in specs {
+        let ToolSpec::Namespace(namespace) = spec else {
+            flat_specs.push(spec);
+            continue;
+        };
+        for tool in namespace.tools {
+            let ResponsesApiNamespaceTool::Function(mut tool) = tool;
+            let base_name = flattened_tool_name(&namespace.name, &tool.name);
+            let Some(flat_name) = std::iter::once(base_name.clone())
+                .chain((2..=9).map(|suffix| format!("{base_name}_{suffix}")))
+                .find(|candidate| !taken_names.contains(candidate))
+            else {
+                warn!(
+                    "Skipping tool `{}` in namespace `{}`: `{base_name}` is already taken",
+                    tool.name, namespace.name
+                );
+                continue;
+            };
+            taken_names.insert(flat_name.clone());
+            aliases.insert(
+                ToolName::plain(flat_name.clone()),
+                ToolName::namespaced(namespace.name.clone(), tool.name.clone()),
+            );
+            tool.name = flat_name;
+            flat_specs.push(ToolSpec::Function(tool));
+        }
+    }
+    (flat_specs, aliases)
+}
+
+fn flattened_tool_name(namespace: &str, name: &str) -> String {
+    format!(
+        "{}__{}",
+        namespace.trim_end_matches('_'),
+        name.trim_start_matches('_')
+    )
 }
 
 fn spec_for_model_request(
@@ -614,12 +682,55 @@ fn add_tool_sources(context: &CoreToolPlanContext<'_>, planned_tools: &mut Plann
     add_shell_tools(context, planned_tools);
     add_mcp_resource_tools(context, planned_tools);
     add_core_utility_tools(context, planned_tools);
+    add_client_web_tools(context, planned_tools);
     add_collaboration_tools(context, planned_tools);
     add_mcp_runtime_tools(context, planned_tools);
     add_extension_tools(context, planned_tools);
     add_dynamic_tools(context, planned_tools);
     for spec in hosted_model_tool_specs(context) {
         planned_tools.add_hosted_spec(spec);
+    }
+}
+
+/// Local model servers cannot run the hosted `web_search` tool, so the CLI
+/// executes web search and page fetching for them itself.
+fn client_web_tools_enabled(turn_context: &TurnContext) -> bool {
+    if !turn_context.provider.info().is_local_server()
+        || turn_context.provider.capabilities().web_search
+    {
+        return false;
+    }
+    let web_search_mode = &turn_context.config.web_search_mode;
+    match web_search_mode.value() {
+        WebSearchMode::Disabled => false,
+        WebSearchMode::Live => true,
+        // A local server has no cached or indexed corpus, so these tools always
+        // reach the live web: offer them only where live access is permitted.
+        WebSearchMode::Cached | WebSearchMode::Indexed => {
+            web_search_mode.can_set(&WebSearchMode::Live).is_ok()
+        }
+    }
+}
+
+#[instrument(level = "trace", skip_all)]
+fn add_client_web_tools(context: &CoreToolPlanContext<'_>, planned_tools: &mut PlannedTools) {
+    if !client_web_tools_enabled(context.step_context.turn.as_ref()) {
+        return;
+    }
+    // A client-supplied dynamic tool keeps its name; the built-in steps aside.
+    let dynamic_function_names = context
+        .dynamic_tools
+        .iter()
+        .filter_map(|spec| match spec {
+            DynamicToolSpec::Function(tool) => Some(tool.name.as_str()),
+            DynamicToolSpec::Namespace(_) => None,
+        })
+        .collect::<HashSet<_>>();
+    if !dynamic_function_names.contains(LOCAL_WEB_SEARCH_TOOL_NAME) {
+        planned_tools.add(LocalWebSearchHandler);
+    }
+    if !dynamic_function_names.contains(LOCAL_WEB_FETCH_TOOL_NAME) {
+        planned_tools.add(LocalWebFetchHandler);
     }
 }
 

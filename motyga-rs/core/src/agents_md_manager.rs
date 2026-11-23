@@ -3,6 +3,7 @@ use crate::agents_md::load_project_instructions;
 use crate::config::Config;
 use crate::environment_selection::TurnEnvironmentSnapshot;
 use motyga_extension_api::UserInstructions;
+use motyga_protocol::config_types::TrustLevel;
 use motyga_protocol::protocol::TurnEnvironmentSelection;
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -16,6 +17,7 @@ pub(crate) struct AgentsMdManager {
 #[derive(Default)]
 struct AgentsMdCache {
     selections: Option<Vec<TurnEnvironmentSelection>>,
+    active_project_trust_level: Option<TrustLevel>,
     loaded: Option<Arc<LoadedAgentsMd>>,
 }
 
@@ -30,8 +32,16 @@ impl AgentsMdManager {
 
     pub(crate) async fn refresh(&self, config: &Config, environments: &TurnEnvironmentSnapshot) {
         let selections = environments.to_selections();
-        if self.cache.lock().await.selections.as_ref() == Some(&selections) {
-            return;
+        // Trust can change at runtime (e.g. after the trust prompt), which changes
+        // whether project instructions apply at all.
+        let active_project_trust_level = config.active_project.trust_level;
+        {
+            let cache = self.cache.lock().await;
+            if cache.selections.as_ref() == Some(&selections)
+                && cache.active_project_trust_level == active_project_trust_level
+            {
+                return;
+            }
         }
 
         let loaded =
@@ -40,6 +50,7 @@ impl AgentsMdManager {
                 .map(Arc::new);
         let mut cache = self.cache.lock().await;
         cache.selections = Some(selections);
+        cache.active_project_trust_level = active_project_trust_level;
         cache.loaded = loaded;
     }
 

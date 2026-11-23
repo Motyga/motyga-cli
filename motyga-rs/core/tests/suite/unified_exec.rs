@@ -6,18 +6,6 @@ use std::sync::OnceLock;
 
 use anyhow::Context;
 use anyhow::Result;
-use motyga_exec_server::CreateDirectoryOptions;
-use motyga_features::Feature;
-use motyga_protocol::models::PermissionProfile;
-use motyga_protocol::models::ResponseItem;
-use motyga_protocol::permissions::NetworkSandboxPolicy;
-use motyga_protocol::protocol::AskForApproval;
-use motyga_protocol::protocol::EventMsg;
-use motyga_protocol::protocol::ExecCommandSource;
-use motyga_protocol::protocol::ExecCommandStatus;
-use motyga_protocol::protocol::Op;
-use motyga_protocol::user_input::UserInput;
-use motyga_utils_path_uri::PathUri;
 use core_test_support::TempDirExt;
 use core_test_support::assert_regex_match;
 use core_test_support::managed_network_requirements_loader;
@@ -43,6 +31,18 @@ use core_test_support::test_motyga::turn_permission_fields;
 use core_test_support::wait_for_event;
 use core_test_support::wait_for_event_match;
 use core_test_support::wait_for_event_with_timeout;
+use motyga_exec_server::CreateDirectoryOptions;
+use motyga_features::Feature;
+use motyga_protocol::models::PermissionProfile;
+use motyga_protocol::models::ResponseItem;
+use motyga_protocol::permissions::NetworkSandboxPolicy;
+use motyga_protocol::protocol::AskForApproval;
+use motyga_protocol::protocol::EventMsg;
+use motyga_protocol::protocol::ExecCommandSource;
+use motyga_protocol::protocol::ExecCommandStatus;
+use motyga_protocol::protocol::Op;
+use motyga_protocol::user_input::UserInput;
+use motyga_utils_path_uri::PathUri;
 use pretty_assertions::assert_eq;
 use regex_lite::Regex;
 use serde_json::Value;
@@ -2172,9 +2172,14 @@ async fn assert_write_stdin_ctrl_c_interrupts_non_tty_session(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[cfg_attr(not(windows), ignore = "Windows-only unified exec interrupt test")]
-async fn write_stdin_ctrl_c_reports_unsupported_interrupt_to_model_on_windows() -> Result<()> {
-    skip_if_no_network!(Ok(()));
+async fn write_stdin_ctrl_c_terminates_non_tty_session_on_windows() -> Result<()> {
+    if core_test_support::test_target_os() != core_test_support::TestTargetOs::Windows {
+        return Ok(());
+    }
+    skip_if_wine_exec!(
+        Ok(()),
+        "Wine exits Windows non-TTY shell processes immediately"
+    );
     skip_if_sandbox!(Ok(()));
 
     let server = start_mock_server().await;
@@ -2191,8 +2196,7 @@ async fn write_stdin_ctrl_c_reports_unsupported_interrupt_to_model_on_windows() 
     let interrupt_call_id = "uexec-windows-interrupt";
 
     let start_args = serde_json::json!({
-        "shell": "cmd",
-        "cmd": "echo READY && ping -n 30 127.0.0.1 >NUL",
+        "cmd": "Start-Sleep -Seconds 30",
         "yield_time_ms": 250,
         "tty": false,
     });
@@ -2250,23 +2254,15 @@ async fn write_stdin_ctrl_c_reports_unsupported_interrupt_to_model_on_windows() 
         Some("1000"),
         "exec_command should leave a running non-TTY session"
     );
-    assert!(
-        start_output.output.contains("READY"),
-        "start output should include command readiness marker, got {:?}",
-        start_output.output
-    );
-
     let interrupt_output = request_log
         .function_call_output_text(interrupt_call_id)
         .expect("missing interrupt output for write_stdin");
+    let interrupt_output = parse_unified_exec_output(&interrupt_output)?;
     assert!(
-        interrupt_output.contains("write_stdin failed"),
-        "model-visible write_stdin output should report failure, got {interrupt_output:?}"
+        interrupt_output.process_id.is_none(),
+        "interrupted process should be cleared from the session map"
     );
-    assert!(
-        interrupt_output.contains("process interrupt is not supported by this process backend"),
-        "model-visible write_stdin output should explain unsupported interrupt, got {interrupt_output:?}"
-    );
+    assert_eq!(interrupt_output.exit_code, Some(1));
 
     Ok(())
 }

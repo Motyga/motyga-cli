@@ -252,6 +252,20 @@ impl ModelProvider for ConfiguredModelProvider {
         self.auth_manager.clone()
     }
 
+    fn capabilities(&self) -> ProviderCapabilities {
+        if self.info.is_local_server() {
+            // Local servers implement plain function tools only: hosted tools and
+            // namespaced tool groups are OpenAI extensions they reject or ignore.
+            ProviderCapabilities {
+                namespace_tools: false,
+                image_generation: false,
+                web_search: false,
+            }
+        } else {
+            ProviderCapabilities::default()
+        }
+    }
+
     fn supports_attestation(&self) -> bool {
         self.auth_manager
             .as_ref()

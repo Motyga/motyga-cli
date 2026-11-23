@@ -58,12 +58,9 @@ use serde::Serialize;
 use serde::de::Error as SerdeError;
 use serde_json::Value as JsonValue;
 
-const RESERVED_MODEL_PROVIDER_IDS: [&str; 4] = [
-    AMAZON_BEDROCK_PROVIDER_ID,
-    OPENAI_PROVIDER_ID,
-    OLLAMA_OSS_PROVIDER_ID,
-    LMSTUDIO_OSS_PROVIDER_ID,
-];
+// `ollama` and `lmstudio` are deliberately absent: a configured local server
+// (for example Ollama on another machine) replaces those built-in defaults.
+const RESERVED_MODEL_PROVIDER_IDS: [&str; 2] = [AMAZON_BEDROCK_PROVIDER_ID, OPENAI_PROVIDER_ID];
 
 pub const DEFAULT_PROJECT_DOC_MAX_BYTES: usize = 32 * 1024;
 
@@ -516,6 +513,10 @@ pub struct ConfigToml {
     pub experimental_use_unified_exec_tool: Option<bool>,
     /// Preferred OSS provider for local models, e.g. "lmstudio" or "ollama".
     pub oss_provider: Option<String>,
+    /// Model that `--oss` starts with when `oss_provider` is the selected local
+    /// provider. Kept apart from `model` so a local model name never reaches the
+    /// cloud provider.
+    pub oss_model: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema)]

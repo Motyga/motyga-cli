@@ -212,6 +212,83 @@ impl ModelsEndpointClient for TestModelsEndpoint {
     }
 }
 
+/// A local model server: its `/models` is the whole catalog, cached separately.
+#[derive(Debug)]
+struct LocalServerModelsEndpoint {
+    inner: Arc<TestModelsEndpoint>,
+}
+
+impl ModelsEndpointClient for LocalServerModelsEndpoint {
+    fn has_command_auth(&self) -> bool {
+        false
+    }
+
+    fn uses_motyga_backend(&self) -> ModelsEndpointFuture<'_, bool> {
+        Box::pin(async { false })
+    }
+
+    fn serves_full_catalog(&self) -> bool {
+        true
+    }
+
+    fn cache_scope(&self) -> Option<String> {
+        Some("http://localhost:11434/v1".to_string())
+    }
+
+    fn list_models<'a>(
+        &'a self,
+        _client_version: &'a str,
+    ) -> ModelsEndpointFuture<'a, CoreResult<(Vec<ModelInfo>, Option<String>)>> {
+        Box::pin(self.inner.list_models())
+    }
+}
+
+#[tokio::test]
+async fn local_server_catalog_replaces_bundled_models_and_uses_its_own_cache() {
+    let motyga_home = tempdir().expect("temp dir");
+    let endpoint = Arc::new(LocalServerModelsEndpoint {
+        inner: TestModelsEndpoint::without_refresh(vec![vec![
+            remote_model("qwen3:8b", "qwen3:8b", /*priority*/ 99),
+            remote_model("llama3.2:3b", "llama3.2:3b", /*priority*/ 99),
+        ]]),
+    });
+    let manager = openai_manager_for_tests_with_auth(
+        motyga_home.path().to_path_buf(),
+        endpoint,
+        /*auth_manager*/ None,
+    );
+
+    assert_eq!(manager.get_remote_models().await, Vec::<ModelInfo>::new());
+    manager
+        .refresh_available_models(RefreshStrategy::Online)
+        .await
+        .expect("local refresh should succeed");
+
+    let slugs: Vec<String> = manager
+        .get_remote_models()
+        .await
+        .into_iter()
+        .map(|model| model.slug)
+        .collect();
+    assert_eq!(slugs, vec!["qwen3:8b".to_string(), "llama3.2:3b".to_string()]);
+    let cache_files: Vec<String> = std::fs::read_dir(motyga_home.path())
+        .expect("read motyga home")
+        .filter_map(|entry| entry.ok()?.file_name().into_string().ok())
+        .filter(|name| name.starts_with("models_cache"))
+        .collect();
+    assert_eq!(
+        cache_files,
+        vec![format!(
+            "models_cache.local-{:016x}.json",
+            "http://localhost:11434/v1"
+                .bytes()
+                .fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| {
+                    (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3)
+                })
+        )]
+    );
+}
+
 fn openai_manager_for_tests(
     motyga_home: std::path::PathBuf,
     endpoint_client: Arc<dyn ModelsEndpointClient>,

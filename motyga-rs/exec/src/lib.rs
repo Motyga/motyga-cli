@@ -13,6 +13,43 @@ pub(crate) mod exec_events;
 pub use cli::Cli;
 pub use cli::Command;
 pub use cli::ReviewArgs;
+use event_processor_with_human_output::EventProcessorWithHumanOutput;
+pub use event_processor_with_jsonl_output::CollectedThreadEvents;
+pub use event_processor_with_jsonl_output::EventProcessorWithJsonOutput;
+pub use event_processor_with_jsonl_output::MotygaStatus;
+pub use exec_events::AgentMessageItem;
+pub use exec_events::CollabAgentState;
+pub use exec_events::CollabAgentStatus;
+pub use exec_events::CollabTool;
+pub use exec_events::CollabToolCallItem;
+pub use exec_events::CollabToolCallStatus;
+pub use exec_events::CommandExecutionItem;
+pub use exec_events::CommandExecutionStatus;
+pub use exec_events::ErrorItem;
+pub use exec_events::FileChangeItem;
+pub use exec_events::FileUpdateChange;
+pub use exec_events::ItemCompletedEvent;
+pub use exec_events::ItemStartedEvent;
+pub use exec_events::ItemUpdatedEvent;
+pub use exec_events::McpToolCallItem;
+pub use exec_events::McpToolCallItemError;
+pub use exec_events::McpToolCallItemResult;
+pub use exec_events::McpToolCallStatus;
+pub use exec_events::PatchApplyStatus;
+pub use exec_events::PatchChangeKind;
+pub use exec_events::ReasoningItem;
+pub use exec_events::ThreadErrorEvent;
+pub use exec_events::ThreadEvent;
+pub use exec_events::ThreadItem as ExecThreadItem;
+pub use exec_events::ThreadItemDetails;
+pub use exec_events::ThreadStartedEvent;
+pub use exec_events::TodoItem;
+pub use exec_events::TodoListItem;
+pub use exec_events::TurnCompletedEvent;
+pub use exec_events::TurnFailedEvent;
+pub use exec_events::TurnStartedEvent;
+pub use exec_events::Usage;
+pub use exec_events::WebSearchItem;
 use motyga_app_server_client::DEFAULT_IN_PROCESS_CHANNEL_CAPACITY;
 use motyga_app_server_client::EnvironmentManager;
 use motyga_app_server_client::ExecServerRuntimePaths;
@@ -78,8 +115,6 @@ use motyga_login::AuthConfig;
 use motyga_login::default_client::set_default_client_residency_requirement;
 use motyga_login::default_client::set_default_originator;
 use motyga_login::enforce_login_restrictions;
-use motyga_model_provider_info::LMSTUDIO_OSS_PROVIDER_ID;
-use motyga_model_provider_info::OLLAMA_OSS_PROVIDER_ID;
 use motyga_otel::set_parent_from_context;
 use motyga_otel::traceparent_context_from_env;
 use motyga_protocol::SessionId;
@@ -99,45 +134,9 @@ use motyga_protocol::user_input::UserInput;
 use motyga_utils_absolute_path::AbsolutePathBuf;
 use motyga_utils_absolute_path::canonicalize_existing_preserving_symlinks;
 use motyga_utils_cli::SharedCliOptions;
+use motyga_utils_oss::detect_running_oss_provider;
 use motyga_utils_oss::ensure_oss_provider_ready;
-use motyga_utils_oss::get_default_model_for_oss_provider;
-use event_processor_with_human_output::EventProcessorWithHumanOutput;
-pub use event_processor_with_jsonl_output::MotygaStatus;
-pub use event_processor_with_jsonl_output::CollectedThreadEvents;
-pub use event_processor_with_jsonl_output::EventProcessorWithJsonOutput;
-pub use exec_events::AgentMessageItem;
-pub use exec_events::CollabAgentState;
-pub use exec_events::CollabAgentStatus;
-pub use exec_events::CollabTool;
-pub use exec_events::CollabToolCallItem;
-pub use exec_events::CollabToolCallStatus;
-pub use exec_events::CommandExecutionItem;
-pub use exec_events::CommandExecutionStatus;
-pub use exec_events::ErrorItem;
-pub use exec_events::FileChangeItem;
-pub use exec_events::FileUpdateChange;
-pub use exec_events::ItemCompletedEvent;
-pub use exec_events::ItemStartedEvent;
-pub use exec_events::ItemUpdatedEvent;
-pub use exec_events::McpToolCallItem;
-pub use exec_events::McpToolCallItemError;
-pub use exec_events::McpToolCallItemResult;
-pub use exec_events::McpToolCallStatus;
-pub use exec_events::PatchApplyStatus;
-pub use exec_events::PatchChangeKind;
-pub use exec_events::ReasoningItem;
-pub use exec_events::ThreadErrorEvent;
-pub use exec_events::ThreadEvent;
-pub use exec_events::ThreadItem as ExecThreadItem;
-pub use exec_events::ThreadItemDetails;
-pub use exec_events::ThreadStartedEvent;
-pub use exec_events::TodoItem;
-pub use exec_events::TodoListItem;
-pub use exec_events::TurnCompletedEvent;
-pub use exec_events::TurnFailedEvent;
-pub use exec_events::TurnStartedEvent;
-pub use exec_events::Usage;
-pub use exec_events::WebSearchItem;
+use motyga_utils_oss::pick_oss_session_model;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::future::Future;
@@ -278,6 +277,8 @@ pub async fn run_main(cli: Cli, arg0_paths: Arg0DispatchPaths) -> anyhow::Result
         cwd,
         add_dir,
     } = shared;
+    // Naming a local provider is a request to use it.
+    let oss = oss || oss_provider.is_some();
 
     let (_stdout_with_ansi, stderr_with_ansi) = match color {
         cli::Color::Always => (true, true),
@@ -301,7 +302,7 @@ pub async fn run_main(cli: Cli, arg0_paths: Arg0DispatchPaths) -> anyhow::Result
     };
 
     // Parse `-c` overrides from the CLI.
-    let cli_kv_overrides = match config_overrides.parse_overrides() {
+    let mut cli_kv_overrides = match config_overrides.parse_overrides() {
         Ok(v) => v,
         #[allow(clippy::print_stderr)]
         Err(e) => {
@@ -372,7 +373,6 @@ pub async fn run_main(cli: Cli, arg0_paths: Arg0DispatchPaths) -> anyhow::Result
         auth_route_config,
     )
     .await;
-    let run_cli_overrides = cli_kv_overrides.clone();
     let run_loader_overrides = loader_overrides.clone();
     let run_cloud_config_bundle = cloud_config_bundle.clone();
 
@@ -398,28 +398,44 @@ pub async fn run_main(cli: Cli, arg0_paths: Arg0DispatchPaths) -> anyhow::Result
 
         let resolved = resolve_oss_provider(oss_provider.as_deref(), config_toml_for_oss);
 
-        if let Some(provider) = resolved {
-            Some(provider)
-        } else {
-            return Err(anyhow::anyhow!(
-                "No default OSS provider configured. Use --local-provider=provider or set oss_provider to one of: {LMSTUDIO_OSS_PROVIDER_ID}, {OLLAMA_OSS_PROVIDER_ID} in config.toml"
-            ));
+        match resolved {
+            Some(provider) => Some(provider),
+            None => Some(
+                detect_running_oss_provider(config_toml_for_oss)
+                    .await
+                    .map_err(anyhow::Error::msg)?,
+            ),
         }
     } else {
         None // No OSS mode enabled
     };
 
-    // When using `--oss`, let the bootstrapper pick the model based on selected provider
-    let model = if let Some(model) = model_cli_arg {
+    // With `--oss`, never inherit `model` (it names a cloud model): use `-m`, the saved
+    // `oss_model`, or a model the local server already has, with the server's context window.
+    let model = if let Some(provider_id) = model_provider.as_deref()
+        && oss
+    {
+        let picked =
+            pick_oss_session_model(provider_id, model_cli_arg.as_deref(), bootstrap_config_toml)
+                .await
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "No model to run on local provider `{provider_id}`: load a model on the server or pass -m <model> (see `motyga local`)."
+                    )
+                })?;
+        if let Some(window) = picked.context_window {
+            cli_kv_overrides.push((
+                "model_context_window".to_string(),
+                motyga_config::TomlValue::Integer(window),
+            ));
+        }
+        Some(picked.model)
+    } else if let Some(model) = model_cli_arg {
         Some(model)
-    } else if oss {
-        model_provider
-            .as_ref()
-            .and_then(|provider_id| get_default_model_for_oss_provider(provider_id))
-            .map(std::borrow::ToOwned::to_owned)
     } else {
         None // No model specified, will use the default.
     };
+    let run_cli_overrides = cli_kv_overrides.clone();
 
     let overrides = ConfigOverrides {
         model,
@@ -709,9 +725,13 @@ async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<()> {
                 ));
             }
         };
-        ensure_oss_provider_ready(provider_id, &config)
+        let warnings = ensure_oss_provider_ready(provider_id, &config)
             .await
             .map_err(|e| anyhow::anyhow!("OSS setup failed: {e}"))?;
+        #[allow(clippy::print_stderr)]
+        for warning in warnings {
+            eprintln!("warning: {warning}");
+        }
     }
 
     let default_cwd = config.cwd.to_path_buf();

@@ -1,3 +1,4 @@
+use motyga_apply_patch::MOTYGA_APPLY_PATCH_PRESERVE_LINE_ENDINGS_ENV_VAR;
 use motyga_utils_cargo_bin::repo_root;
 use pretty_assertions::assert_eq;
 use std::collections::BTreeMap;
@@ -44,6 +45,7 @@ fn run_apply_patch_scenario(dir: &Path) -> anyhow::Result<()> {
     // final filesystem state, which we compare below.
     Command::new(motyga_utils_cargo_bin::cargo_bin("apply_patch")?)
         .arg(patch)
+        .env(MOTYGA_APPLY_PATCH_PRESERVE_LINE_ENDINGS_ENV_VAR, "1")
         .current_dir(tmp.path())
         .output()?;
 

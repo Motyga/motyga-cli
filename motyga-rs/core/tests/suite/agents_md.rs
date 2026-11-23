@@ -7,6 +7,7 @@ use motyga_exec_server::LOCAL_ENVIRONMENT_ID;
 use motyga_exec_server::REMOTE_ENVIRONMENT_ID;
 use motyga_features::Feature;
 use motyga_home::MotygaHomeUserInstructionsProvider;
+use motyga_protocol::config_types::TrustLevel;
 use motyga_protocol::protocol::EventMsg;
 use motyga_protocol::protocol::InitialHistory;
 use motyga_protocol::protocol::Op;
@@ -441,6 +442,102 @@ async fn selected_environment_sources_match_model_visible_instructions() -> Resu
         .find(|text| text.starts_with("# AGENTS.md instructions"))
         .expect("instructions message");
     assert!(instructions.contains("global doc\n\n--- project-doc ---\n\nproject doc"));
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn untrusted_project_excludes_project_instructions() -> Result<()> {
+    let server = start_mock_server().await;
+    let resp_mock = mount_sse_once(
+        &server,
+        sse(vec![ev_response_created("resp1"), ev_completed("resp1")]),
+    )
+    .await;
+    let home = Arc::new(TempDir::new()?);
+    let global_agents = home.path().join("AGENTS.md");
+    std::fs::write(&global_agents, "global doc")?;
+
+    let mut builder = test_motyga()
+        .with_home(home)
+        .with_config(|config| {
+            config.active_project.trust_level = Some(TrustLevel::Untrusted);
+        })
+        .with_workspace_setup(|cwd, fs| async move {
+            let agents_md_uri = PathUri::from_host_native_path(cwd.join("AGENTS.md"))?;
+            fs.write_file(
+                &agents_md_uri,
+                b"project doc".to_vec(),
+                /*sandbox*/ None,
+            )
+            .await?;
+            Ok::<(), anyhow::Error>(())
+        });
+    let test = builder.build_with_auto_env(&server).await?;
+
+    assert_eq!(
+        test.motyga.instruction_sources().await,
+        vec![PathUri::from_abs_path(&global_agents.abs())]
+    );
+
+    test.submit_turn("hello").await?;
+    let instructions = resp_mock
+        .single_request()
+        .message_input_texts("user")
+        .into_iter()
+        .find(|text| text.starts_with("# AGENTS.md instructions"))
+        .expect("global instructions message");
+    assert!(instructions.contains("global doc"));
+    assert!(!instructions.contains("project doc"));
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn runtime_trust_change_refreshes_project_instructions() -> Result<()> {
+    let server = start_mock_server().await;
+    let _responses = responses::mount_sse_sequence(
+        &server,
+        vec![
+            sse(vec![ev_response_created("resp1"), ev_completed("resp1")]),
+            sse(vec![ev_response_created("resp2"), ev_completed("resp2")]),
+        ],
+    )
+    .await;
+    let home = Arc::new(TempDir::new()?);
+    let global_agents = home.path().join("AGENTS.md");
+    std::fs::write(&global_agents, "global doc")?;
+
+    let mut builder = test_motyga()
+        .with_home(home)
+        .with_config(|config| {
+            config.active_project.trust_level = Some(TrustLevel::Trusted);
+        })
+        .with_workspace_setup(|cwd, fs| async move {
+            let agents_md_uri = PathUri::from_host_native_path(cwd.join("AGENTS.md"))?;
+            fs.write_file(
+                &agents_md_uri,
+                b"project doc".to_vec(),
+                /*sandbox*/ None,
+            )
+            .await?;
+            Ok::<(), anyhow::Error>(())
+        });
+    let test = builder.build_with_auto_env(&server).await?;
+    let global_agents = PathUri::from_abs_path(&global_agents.abs());
+    let project_agents = PathUri::from_abs_path(&test.config.cwd.join("AGENTS.md"));
+
+    test.submit_turn("trusted project").await?;
+    assert_eq!(
+        test.motyga.instruction_sources().await,
+        vec![global_agents.clone(), project_agents]
+    );
+
+    let mut untrusted_config = (*test.motyga.config().await).clone();
+    untrusted_config.active_project.trust_level = Some(TrustLevel::Untrusted);
+    test.motyga.refresh_runtime_config(untrusted_config).await;
+    test.submit_turn("untrusted project").await?;
+    assert_eq!(test.motyga.instruction_sources().await, vec![global_agents]);
 
     Ok(())
 }

@@ -92,13 +92,18 @@ impl OpenAiModelsEndpoint {
         let client = ModelsClient::new(transport, api_provider, api_auth)
             .with_telemetry(Some(request_telemetry));
 
-        timeout(
+        let (mut models, etag) = timeout(
             MODELS_REFRESH_TIMEOUT,
             client.list_models(client_version, HeaderMap::new()),
         )
         .await
         .map_err(|_| MotygaErr::Timeout)?
-        .map_err(map_api_error)
+        .map_err(map_api_error)?;
+        if self.provider_info.is_local_server() {
+            // Ollama and LM Studio list embedding models next to chat models.
+            models.retain(|model| !model.slug.to_ascii_lowercase().contains("embed"));
+        }
+        Ok((models, etag))
     }
 
     fn auth_env(&self) -> AuthEnvTelemetry {
@@ -116,7 +121,15 @@ impl ModelsEndpointClient for OpenAiModelsEndpoint {
     }
 
     fn serves_full_catalog(&self) -> bool {
-        self.provider_info.is_motyga()
+        // A local server's `/models` is the exact set of models it can run.
+        self.provider_info.is_motyga() || self.provider_info.is_local_server()
+    }
+
+    fn cache_scope(&self) -> Option<String> {
+        self.provider_info
+            .is_local_server()
+            .then(|| self.provider_info.base_url.clone())
+            .flatten()
     }
 
     fn uses_motyga_backend(&self) -> ModelsEndpointFuture<'_, bool> {

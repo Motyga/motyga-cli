@@ -114,11 +114,7 @@ impl OssSelectionWidget<'_> {
                 status: lmstudio_status,
             },
             ProviderOption {
-                name: "Ollama (Responses)".to_string(),
-                status: ollama_status.clone(),
-            },
-            ProviderOption {
-                name: "Ollama (Chat)".to_string(),
+                name: "Ollama".to_string(),
                 status: ollama_status,
             },
         ];

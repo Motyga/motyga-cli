@@ -19,6 +19,7 @@ use crossterm::cursor::SetCursorStyle;
 use crossterm::event::DisableBracketedPaste;
 use crossterm::event::DisableFocusChange;
 use crossterm::event::EnableBracketedPaste;
+#[cfg(not(windows))]
 use crossterm::event::EnableFocusChange;
 use crossterm::event::KeyEvent;
 use crossterm::terminal::EnterAlternateScreen;
@@ -62,6 +63,8 @@ mod keyboard_modes;
 mod terminal_stderr;
 #[cfg(test)]
 pub(crate) mod test_support;
+#[cfg(any(windows, test))]
+mod windows_console;
 
 /// Target frame interval for UI redraw scheduling.
 pub(crate) const TARGET_FRAME_INTERVAL: Duration = frame_rate_limiter::MIN_FRAME_INTERVAL;
@@ -123,6 +126,26 @@ mod tests {
     }
 
     #[test]
+    fn windows_console_input_modes_preserve_original_vt_input_state() {
+        let input_record_mode = super::windows_console::input_record_mode(/*mode*/ 0x398);
+        assert_eq!(input_record_mode, 0x198);
+        assert_eq!(
+            super::windows_console::restored_input_mode(
+                input_record_mode,
+                super::windows_console::VirtualTerminalInput::Enabled,
+            ),
+            0x398
+        );
+        assert_eq!(
+            super::windows_console::restored_input_mode(
+                /*mode*/ 0x198,
+                super::windows_console::VirtualTerminalInput::Disabled,
+            ),
+            0x198
+        );
+    }
+
+    #[test]
     fn unfocused_notification_condition_emits_when_unfocused() {
         assert!(should_emit_notification(
             NotificationCondition::Unfocused,
@@ -178,6 +201,8 @@ pub fn set_modes() -> Result<()> {
     execute!(stdout(), EnableBracketedPaste)?;
 
     enable_raw_mode()?;
+    #[cfg(windows)]
+    windows_console::set_input_record_mode()?;
     // Enable keyboard enhancement flags so modifiers for keys like Enter are disambiguated.
     // chat_composer.rs is using a keyboard event listener to enter for any modified keys
     // to create a new line that require this.
@@ -186,7 +211,10 @@ pub fn set_modes() -> Result<()> {
     // gracefully if unsupported.
     keyboard_modes::enable_keyboard_enhancement();
 
+    #[cfg(not(windows))]
     let _ = execute!(stdout(), EnableFocusChange);
+    #[cfg(windows)]
+    let _ = execute!(stdout(), DisableFocusChange);
     Ok(())
 }
 
@@ -262,6 +290,10 @@ fn restore_common(
     if matches!(raw_mode_restore, RawModeRestore::Disable)
         && let Err(err) = disable_raw_mode()
     {
+        first_error.get_or_insert(err);
+    }
+    #[cfg(windows)]
+    if let Err(err) = windows_console::restore_input_mode() {
         first_error.get_or_insert(err);
     }
     if let Err(err) = execute!(

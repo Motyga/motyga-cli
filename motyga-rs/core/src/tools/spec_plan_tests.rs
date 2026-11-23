@@ -1666,3 +1666,152 @@ async fn hosted_tools_follow_provider_auth_model_and_config_gates() {
     .await;
     unsupported_provider.assert_visible_lacks(&["web_search"]);
 }
+
+fn use_local_provider(turn: &mut TurnContext) {
+    let provider_info = motyga_model_provider_info::create_oss_provider_with_base_url(
+        "http://localhost:11434/v1",
+        motyga_model_provider_info::WireApi::Responses,
+    );
+    update_config(turn, |config| {
+        config.model_provider_id = "ollama".to_string();
+        config.model_provider = provider_info.clone();
+    });
+    turn.provider = create_model_provider(provider_info, turn.auth_manager.clone());
+}
+
+#[tokio::test]
+async fn local_provider_gets_flat_mcp_tools_and_client_web_tools() {
+    let plan = probe_with(
+        |turn| {
+            use_local_provider(turn);
+            set_feature(turn, Feature::CurrentTimeReminder, /*enabled*/ true);
+        },
+        ToolPlanInputs {
+            mcp_tools: Some(vec![mcp_tool("docs", "mcp__docs", "lookup")]),
+            ..Default::default()
+        },
+    )
+    .await;
+
+    plan.assert_visible_contains(&[
+        "mcp__docs__lookup",
+        "clock__curr_time",
+        "web_search",
+        "web_fetch",
+    ]);
+    assert!(
+        plan.visible_specs
+            .iter()
+            .all(|spec| matches!(spec, ToolSpec::Function(_) | ToolSpec::Freeform(_))),
+        "local servers must only see plain tools: {:?}",
+        plan.visible_names
+    );
+    let ToolSpec::Function(lookup) = plan.visible_spec("mcp__docs__lookup") else {
+        panic!("expected a plain function for the MCP tool");
+    };
+    assert_eq!(lookup.description, "lookup test tool");
+    plan.assert_registered_contains(&["web_search", "web_fetch"]);
+}
+
+#[tokio::test]
+async fn local_provider_routes_flat_tool_calls_to_namespaced_tools() {
+    let (_session, mut turn) = make_session_and_context().await;
+    use_local_provider(&mut turn);
+    let turn = Arc::new(turn);
+    let step_context = StepContext::for_test(Arc::clone(&turn));
+    let mut tool = mcp_tool("docs", "mcp__docs", "lookup");
+    tool.supports_parallel_tool_calls = true;
+    let router = ToolRouter::from_context(
+        step_context.as_ref(),
+        ToolRouterParams {
+            tool_suggest_candidates: None,
+            mcp_tools: Some(vec![tool]),
+            deferred_mcp_tools: None,
+            extension_tool_executors: Vec::new(),
+            dynamic_tools: &[],
+        },
+        &Default::default(),
+    );
+    let call = |tool_name: ToolName| crate::tools::router::ToolCall {
+        tool_name,
+        call_id: "call-1".to_string(),
+        payload: crate::tools::context::ToolPayload::Function {
+            arguments: "{}".to_string(),
+        },
+    };
+
+    assert!(router.tool_supports_parallel(&call(ToolName::plain("mcp__docs__lookup"))));
+    assert!(router.tool_supports_parallel(&call(ToolName::namespaced("mcp__docs", "lookup"))));
+    assert!(!router.tool_supports_parallel(&call(ToolName::plain("mcp__docs__missing"))));
+}
+
+#[tokio::test]
+async fn client_web_tools_follow_provider_and_web_search_mode() {
+    let disabled = probe(|turn| {
+        use_local_provider(turn);
+        set_web_search_mode(turn, WebSearchMode::Disabled);
+    })
+    .await;
+    disabled.assert_visible_lacks(&["web_search", "web_fetch"]);
+    disabled.assert_registered_lacks(&["web_search", "web_fetch"]);
+
+    let hosted = probe(|turn| set_web_search_mode(turn, WebSearchMode::Live)).await;
+    hosted.assert_registered_lacks(&["web_search", "web_fetch"]);
+
+    let bedrock = probe(|turn| {
+        set_web_search_mode(turn, WebSearchMode::Live);
+        use_bedrock_provider(turn);
+    })
+    .await;
+    bedrock.assert_registered_lacks(&["web_search", "web_fetch"]);
+}
+
+#[tokio::test]
+async fn flattened_names_never_collide_with_registered_tools() {
+    let plan = probe_with(
+        use_local_provider,
+        ToolPlanInputs {
+            mcp_tools: Some(vec![mcp_tool("docs", "mcp__docs", "lookup")]),
+            dynamic_tools: vec![
+                dynamic_tool(/*namespace*/ None, "mcp__docs__lookup", /*defer_loading*/ false),
+                dynamic_tool(/*namespace*/ None, "web_fetch", /*defer_loading*/ false),
+            ],
+            ..Default::default()
+        },
+    )
+    .await;
+
+    plan.assert_visible_contains(&["mcp__docs__lookup", "mcp__docs__lookup_2", "web_search"]);
+    let ToolSpec::Function(dynamic) = plan.visible_spec("mcp__docs__lookup") else {
+        panic!("expected the dynamic tool to keep its name");
+    };
+    assert_eq!(dynamic.description, "mcp__docs__lookup dynamic tool");
+    let ToolSpec::Function(mcp) = plan.visible_spec("mcp__docs__lookup_2") else {
+        panic!("expected the MCP tool under a suffixed name");
+    };
+    assert_eq!(mcp.description, "lookup test tool");
+    let ToolSpec::Function(fetch) = plan.visible_spec("web_fetch") else {
+        panic!("expected the dynamic web_fetch");
+    };
+    assert_eq!(fetch.description, "web_fetch dynamic tool");
+}
+
+#[tokio::test]
+async fn client_web_tools_respect_a_cached_only_requirement() {
+    let restricted = probe(|turn| {
+        use_local_provider(turn);
+        update_config(turn, |config| {
+            config.web_search_mode =
+                crate::config::Constrained::allow_only(WebSearchMode::Cached);
+        });
+    })
+    .await;
+    restricted.assert_registered_lacks(&["web_search", "web_fetch"]);
+
+    let default_cached = probe(|turn| {
+        use_local_provider(turn);
+        set_web_search_mode(turn, WebSearchMode::Cached);
+    })
+    .await;
+    default_cached.assert_registered_contains(&["web_search", "web_fetch"]);
+}

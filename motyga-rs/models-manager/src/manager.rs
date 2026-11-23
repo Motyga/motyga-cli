@@ -44,6 +44,13 @@ pub trait ModelsEndpointClient: fmt::Debug + Send + Sync {
         false
     }
 
+    /// Identity of the catalog this endpoint serves when it must not share the
+    /// default `models_cache.json` (for example a local model server). `None`
+    /// keeps the default cache file.
+    fn cache_scope(&self) -> Option<String> {
+        None
+    }
+
     /// Fetches the latest remote model catalog and optional ETag.
     fn list_models<'a>(
         &'a self,
@@ -238,9 +245,25 @@ impl OpenAiModelsManager {
         endpoint_client: Arc<dyn ModelsEndpointClient>,
         auth_manager: Option<Arc<AuthManager>>,
     ) -> Self {
-        let cache_path = motyga_home.join(MODEL_CACHE_FILE);
+        // A scoped endpoint (a local model server) serves its own catalog: it gets its
+        // own cache file and never starts from the bundled OpenAI models.
+        let (cache_path, remote_models) = match endpoint_client.cache_scope() {
+            Some(scope) => {
+                // FNV-1a: stable across builds, unlike `DefaultHasher`.
+                let digest = scope.bytes().fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| {
+                    (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3)
+                });
+                (
+                    motyga_home.join(format!("models_cache.local-{digest:016x}.json")),
+                    Vec::new(),
+                )
+            }
+            None => (
+                motyga_home.join(MODEL_CACHE_FILE),
+                load_remote_models_from_file().unwrap_or_default(),
+            ),
+        };
         let cache_manager = ModelsCacheManager::new(cache_path, DEFAULT_MODEL_CACHE_TTL);
-        let remote_models = load_remote_models_from_file().unwrap_or_default();
         Self {
             remote_models: RwLock::new(remote_models),
             etag: RwLock::new(None),
@@ -407,16 +430,17 @@ impl OpenAiModelsManager {
         // Use the remote models list as the source of truth if it contains at least one
         // non-hidden model and either the provider serves the full catalog (Motyga) or the
         // user is on ChatGPT auth.
-        let should_use_remote_models_only = !models.is_empty()
-            && models
-                .iter()
-                .any(|model| model.visibility == ModelVisibility::List)
-            && (self.endpoint_client.serves_full_catalog()
-                || self.auth_manager.as_ref().is_some_and(|auth_manager| {
-                    auth_manager
-                        .auth_mode()
-                        .is_some_and(AuthMode::has_chatgpt_account)
-                }));
+        let should_use_remote_models_only = self.endpoint_client.cache_scope().is_some()
+            || (!models.is_empty()
+                && models
+                    .iter()
+                    .any(|model| model.visibility == ModelVisibility::List)
+                && (self.endpoint_client.serves_full_catalog()
+                    || self.auth_manager.as_ref().is_some_and(|auth_manager| {
+                        auth_manager
+                            .auth_mode()
+                            .is_some_and(AuthMode::has_chatgpt_account)
+                    })));
         if should_use_remote_models_only {
             *self.remote_models.write().await = models;
             return;

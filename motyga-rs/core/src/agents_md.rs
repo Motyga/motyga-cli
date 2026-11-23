@@ -50,6 +50,10 @@ pub(crate) async fn load_project_instructions(
     environments: &TurnEnvironmentSnapshot,
 ) -> Option<LoadedAgentsMd> {
     let mut loaded = LoadedAgentsMd::from_user_instructions(user_instructions);
+    // An untrusted checkout must not steer the model through its AGENTS.md.
+    if config.active_project.is_untrusted() {
+        return (!loaded.is_empty()).then_some(loaded);
+    }
     for turn_environment in &environments.turn_environments {
         let filesystem = turn_environment.environment.get_filesystem();
         match read_agents_md(

@@ -66,6 +66,7 @@ assert_cmd = { workspace = true }
 motyga-apply-patch = { workspace = true }
 motyga-utils-cargo-bin = { workspace = true }
 core_test_support = { workspace = true }
+insta = { workspace = true }
 libc = { workspace = true }
 opentelemetry = { workspace = true }
 opentelemetry_sdk = { workspace = true }

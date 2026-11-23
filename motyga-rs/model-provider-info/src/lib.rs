@@ -460,6 +460,24 @@ impl ModelProviderInfo {
         self.name == AMAZON_BEDROCK_PROVIDER_NAME
     }
 
+    /// True for a model server on this machine or the local network (Ollama,
+    /// LM Studio, llama.cpp, vLLM, ...). Such servers implement only the core of
+    /// the Responses API and must never receive Motyga or OpenAI credentials.
+    pub fn is_local_server(&self) -> bool {
+        !self.is_motyga()
+            && !self.is_openai()
+            && self.base_url.as_deref().is_some_and(is_local_base_url)
+    }
+
+    /// Whether a stored Motyga login (an `nb-` key) may be sent here. That depends on
+    /// where requests go, not on the configurable display name: Motyga's own HTTPS
+    /// endpoints, or a Motyga-named gateway on this machine or the LAN.
+    pub fn accepts_motyga_login(&self) -> bool {
+        self.base_url.as_deref().is_some_and(|base_url| {
+            is_motyga_base_url(base_url) || (self.is_motyga() && is_local_base_url(base_url))
+        })
+    }
+
     pub fn supports_remote_compaction(&self) -> bool {
         self.is_openai() || is_azure_responses_provider(&self.name, self.base_url.as_deref())
     }
@@ -509,7 +527,9 @@ pub fn built_in_model_providers(
 ///
 /// Configured providers extend the built-in set. Built-in providers are not
 /// generally overridable, but the built-in Amazon Bedrock provider allows the
-/// user to set `aws.profile` and `aws.region`.
+/// user to set `aws.profile` and `aws.region`, the built-in Motyga provider
+/// accepts another `https://*.motyga.com` `base_url` (a regional mirror), and
+/// `ollama` / `lmstudio` can be replaced entirely.
 pub fn merge_configured_model_providers(
     mut model_providers: HashMap<String, ModelProviderInfo>,
     configured_model_providers: HashMap<String, ModelProviderInfo>,
@@ -535,12 +555,84 @@ pub fn merge_configured_model_providers(
                     built_in_aws.region = Some(region);
                 }
             }
+        } else if key == MOTYGA_PROVIDER_ID {
+            // Only the endpoint may change, and only to another Motyga host: the stored
+            // login goes wherever this provider points, and the built-in retry policy and
+            // headers are tuned for the Motyga gateway.
+            match provider.base_url {
+                Some(base_url) if is_motyga_base_url(&base_url) => {
+                    if let Some(built_in_provider) = model_providers.get_mut(MOTYGA_PROVIDER_ID) {
+                        built_in_provider.base_url = Some(base_url);
+                    }
+                }
+                Some(base_url) => {
+                    return Err(format!(
+                        "model_providers.{MOTYGA_PROVIDER_ID}.base_url must be a https://*.motyga.com \
+endpoint, got `{base_url}`; configure other gateways under a different provider id"
+                    ));
+                }
+                None => {}
+            }
+        } else if key == OLLAMA_OSS_PROVIDER_ID || key == LMSTUDIO_OSS_PROVIDER_ID {
+            // A configured local server (e.g. Ollama on another machine) replaces the
+            // built-in localhost default; nothing about it is security-sensitive.
+            model_providers.insert(key, provider);
         } else {
             model_providers.entry(key).or_insert(provider);
         }
     }
 
     Ok(model_providers)
+}
+
+/// Whether `base_url` points at this machine or a private network: loopback,
+/// RFC 1918 / link-local / unique-local addresses, or `localhost`, `*.local`,
+/// `*.lan`, `*.home.arpa` and `*.internal` host names.
+pub fn is_local_base_url(base_url: &str) -> bool {
+    let Some((_, host)) = scheme_and_host(base_url) else {
+        return false;
+    };
+    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+        return match ip.to_canonical() {
+            std::net::IpAddr::V4(ip) => {
+                ip.is_loopback() || ip.is_private() || ip.is_link_local() || ip.is_unspecified()
+            }
+            std::net::IpAddr::V6(ip) => {
+                ip.is_loopback()
+                    || ip.is_unspecified()
+                    || ip.is_unique_local()
+                    || ip.is_unicast_link_local()
+            }
+        };
+    }
+    host == "localhost"
+        || [".localhost", ".local", ".lan", ".home.arpa", ".internal"]
+            .iter()
+            .any(|suffix| host.ends_with(suffix))
+}
+
+/// Whether `base_url` is an HTTPS endpoint on `motyga.com` or one of its
+/// subdomains (`api.`, the `ru.` / `cn.` mirrors, ...).
+pub fn is_motyga_base_url(base_url: &str) -> bool {
+    scheme_and_host(base_url).is_some_and(|(scheme, host)| {
+        scheme == "https" && (host == "motyga.com" || host.ends_with(".motyga.com"))
+    })
+}
+
+/// Lower-cased scheme and host of a URL, read the way HTTP clients do (WHATWG
+/// rules: `\` also ends the authority, userinfo is skipped, trailing dots dropped).
+fn scheme_and_host(base_url: &str) -> Option<(String, String)> {
+    let (scheme, rest) = base_url.split_once("://")?;
+    let authority = rest.split(['/', '\\', '?', '#']).next().unwrap_or_default();
+    let host_port = authority
+        .rsplit_once('@')
+        .map_or(authority, |(_, host_port)| host_port);
+    let host = match host_port.strip_prefix('[') {
+        Some(bracketed) => bracketed.split(']').next().unwrap_or_default(),
+        None => host_port.split(':').next().unwrap_or_default(),
+    };
+    let host = host.trim_end_matches('.').to_ascii_lowercase();
+    (!host.is_empty()).then(|| (scheme.to_ascii_lowercase(), host))
 }
 
 pub fn create_oss_provider(default_provider_port: u16, wire_api: WireApi) -> ModelProviderInfo {
